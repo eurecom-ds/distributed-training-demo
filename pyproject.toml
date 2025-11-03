@@ -19,3 +19,8 @@ flash-attn = [{ requirement = "torch", match-runtime = true }]
 
 [tool.uv.extra-build-variables]
 flash-attn = { TORCH_CUDA_ARCH_LIST = "8.0", "FLASH_ATTN_CUDA_ARCHS" = "80" }
+
+[dependency-groups]
+dev = [
+    "nvitop>=1.5.3",
+]
