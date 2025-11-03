@@ -150,14 +150,65 @@ def main():
         experiment.log_other("device", str(device))
         experiment.log_other("dtype", str(dtype))
 
-    fsdp_config = dict(
-        reshard_after_forward=True,
-        offload_policy=CPUOffloadPolicy() if args.cpu_offload else None,
-        mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
+    # fsdp_config = dict(
+    #     reshard_after_forward=True,
+    #     offload_policy=CPUOffloadPolicy() if args.cpu_offload else None,
+    #     mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.bfloat16),
+    # )
+    # for decoder in model.model.layers:
+    #     fully_shard(decoder, **fsdp_config)
+    # fully_shard(model, **fsdp_config)
+
+    from torch.distributed.fsdp import (
+        FullyShardedDataParallel as FSDP,
+        MixedPrecision,
+        BackwardPrefetch,
+        ShardingStrategy,
+        CPUOffload,
     )
-    for decoder in model.model.layers:
-        fully_shard(decoder, **fsdp_config)
-    fully_shard(model, **fsdp_config)
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+    from functools import partial
+
+    # Auto-wrap policy: wrap each transformer decoder layer
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={LlamaDecoderLayer},
+    )
+
+    # Configure activation checkpointing for memory efficiency
+    from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+        checkpoint_wrapper,
+        CheckpointImpl,
+        apply_activation_checkpointing,
+    )
+
+    # Apply activation checkpointing to decoder layers
+    non_reentrant_wrapper = partial(
+        checkpoint_wrapper,
+        checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+    )
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=MixedPrecision(
+            param_dtype=dtype,
+            reduce_dtype=torch.bfloat16,
+            buffer_dtype=torch.bfloat16,
+        ),
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=torch.cuda.current_device(),
+        limit_all_gathers=True,
+        use_orig_params=True,
+    )
+
+    # Apply activation checkpointing to all wrapped decoder layers
+    check_fn = lambda submodule: isinstance(submodule, LlamaDecoderLayer)
+    apply_activation_checkpointing(
+        model, checkpoint_wrapper_fn=non_reentrant_wrapper, check_fn=check_fn
+    )
 
     model.to_empty(device="cpu" if args.cpu_offload else device)
     model.apply(
@@ -194,6 +245,7 @@ def main():
         train_data,
         batch_size=args.batch_size,
         collate_fn=default_data_collator,
+        num_workers=2,
         # NOTE: this sampler will split dataset evenly across workers
         sampler=DistributedSampler(train_data, shuffle=True, drop_last=True),
     )
@@ -271,6 +323,9 @@ def main():
 
     timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
 
+    # Gradient accumulation to maintain effective batch size
+    gradient_accumulation_steps = args.gradient_accumulation_steps
+
     for state["epoch"] in range(state["epoch"], args.num_epochs):
         LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
 
@@ -282,9 +337,6 @@ def main():
         batches = iter(dataloader)
 
         for i_step in range(len(dataloader)):
-            # NOTE: prefetches the first layer
-            model.unshard()
-
             with timers["data"], torch.no_grad():
                 batch = next(batches)
                 batch = {k: v.to(device=device) for k, v in batch.items()}
@@ -295,19 +347,22 @@ def main():
 
             with timers["forward"]:
                 outputs = model(**batch)
+                loss = outputs.loss / gradient_accumulation_steps
                 del batch
 
             with timers["backward"]:
-                outputs.loss.backward()
+                loss.backward()
 
+            # Only update weights every N steps
             with timers["update"]:
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=not args.cpu_offload)
+                if (i_step + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=not args.cpu_offload)
 
             state["global_step"] += 1
             state["epoch_step"] += 1
-            state["running_loss"] += outputs.loss.item()
+            state["running_loss"] += outputs.loss.item()  # Track unscaled loss
             progress_bar.update(1)
 
             if state["global_step"] % args.log_freq == 0:
@@ -539,7 +594,8 @@ def _get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--num-epochs", default=100, type=int)
     parser.add_argument("--lr", default=3e-5, type=float)
-    parser.add_argument("-b", "--batch-size", default=16, type=int)
+    parser.add_argument("-b", "--batch-size", default=4, type=int)
+    parser.add_argument("--gradient-accumulation-steps", default=4, type=int)
     parser.add_argument("--log-freq", default=1, type=int)
     parser.add_argument("--ckpt-freq", default=500, type=int)
     parser.add_argument("-s", "--seq-length", default=1024, type=int)
