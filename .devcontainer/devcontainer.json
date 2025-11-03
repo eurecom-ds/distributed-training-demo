@@ -1,0 +1,27 @@
+{
+  "name": "Python (uv)",
+  "image": "nvcr.io/nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "configureZshAsDefaultShell": true
+    }
+  },
+  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh",
+  // Configure tool-specific properties.
+  "runArgs": [
+    "--shm-size=32gb",
+    "--gpus=all"
+  ],
+  "mounts": [
+    "source=/home/${localEnv:USER}/.cache,target=/home/${localEnv:USER}/.cache,type=bind,consistency=cached"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter",
+        "charliermarsh.ruff"
+      ]
+    }
+  }
+}

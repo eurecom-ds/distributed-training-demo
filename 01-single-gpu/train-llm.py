@@ -1,0 +1,519 @@
+import argparse
+from itertools import chain
+import json
+import multiprocessing
+import os
+import time
+from pathlib import Path
+import logging
+
+from comet_ml import Experiment
+import torch
+from torch.utils.data import DataLoader
+import tqdm
+import datasets
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    default_data_collator,
+)
+from comet_ml.integration.pytorch import watch
+
+LOGGER = logging.getLogger(__name__)
+
+
+def main():
+    parser = _get_parser()
+    args = parser.parse_args()
+
+    # Will be modifying this in future version to include rank information
+    logging.basicConfig(
+        format=f"[%(asctime)s] %(levelname)s:%(message)s",
+        level=logging.INFO,
+    )
+
+    # Helpful to log this information when running on multiple nodes to make sure all nodes have the same environment.
+    LOGGER.debug(os.environ)
+    LOGGER.debug(args)
+
+    # Set device and dtype from arguments
+    device = torch.device(args.device)
+    dtype_map = {
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+    dtype = dtype_map[args.dtype]
+    args.batch_size = args.batch_size // 2 if args.dtype == "fp32" else args.batch_size
+    args.batch_size = 1 if args.device == "cpu" else args.batch_size
+
+    # Initialize Comet ML experiment
+    experiment = None
+    if args.experiment_name is not None:
+        experiment = Experiment(
+            project_name=args.comet_project_name,
+            workspace=args.comet_workspace,
+            auto_metric_logging=True,
+            auto_param_logging=True,
+            log_code=True,
+            log_graph=True,
+            auto_histogram_weight_logging=False,
+            auto_histogram_gradient_logging=False,
+            auto_histogram_activation_logging=False,
+        )
+        experiment.set_name(f"{args.experiment_name}-{args.dtype}")
+        experiment.add_tags(["single-gpu", "llm-training", "pytorch"])
+
+        # Log hyperparameters
+        experiment.log_parameters(
+            {
+                "model_name": args.model_name,
+                "dataset_name": args.dataset_name,
+                "dataset_subset": args.dataset_subset,
+                "batch_size": args.batch_size,
+                "seq_length": args.seq_length,
+                "learning_rate": args.lr,
+                "num_epochs": args.num_epochs,
+                "seed": args.seed,
+                "log_freq": args.log_freq,
+                "ckpt_freq": args.ckpt_freq,
+                "optimizer": "AdamW",
+                "lr_scheduler": "CosineAnnealingLR",
+                "dtype": args.dtype,
+                "device": args.device,
+                "save_dir": args.save_dir,
+            }
+        )
+
+        LOGGER.info(f"Comet ML experiment initialized: {experiment.url}")
+
+    # Log device information to Comet
+    if experiment and device.type == "cuda":
+        gpu_props = torch.cuda.get_device_properties(device)
+        experiment.log_parameters(
+            {
+                "gpu_name": gpu_props.name,
+                "gpu_memory_gb": gpu_props.total_memory / 1e9,
+                "cuda_version": torch.version.cuda,
+                "pytorch_version": torch.__version__,
+            }
+        )
+        experiment.log_other("device", str(device))
+        experiment.log_other("dtype", str(dtype))
+
+    # Seed pytorch's RNG. See https://pytorch.org/docs/stable/notes/randomness.html
+    torch.manual_seed(args.seed)
+
+    # Note: Initializing an **untrained** model
+    model: torch.nn.Module
+    with device:
+        config = AutoConfig.from_pretrained(args.model_name, use_cache=False)
+        model = AutoModelForCausalLM.from_config(
+            config,
+            dtype=dtype,
+            attn_implementation="flash_attention_2"
+            if dtype in (torch.float16, torch.bfloat16)
+            else "sdpa",
+        )
+
+    total_params = sum(p.numel() for p in model.parameters())
+    LOGGER.info(f"Training {total_params} model parameters")
+
+    # Log model information to Comet
+    if experiment:
+        experiment.log_parameters(
+            {
+                "total_parameters": total_params,
+                "trainable_parameters": sum(
+                    p.numel() for p in model.parameters() if p.requires_grad
+                ),
+            }
+        )
+        experiment.log_text(str(model), metadata={"type": "model_architecture"})
+
+    model = torch.compile(model)
+
+    initial_mem_stats = get_mem_stats(device)
+    LOGGER.info(f"Initialized model uses {initial_mem_stats['curr_alloc_gb']}gb")
+
+    # Log initial memory stats to Comet
+    if experiment:
+        experiment.log_metrics(
+            {
+                "initial_memory_gb": initial_mem_stats["curr_alloc_gb"],
+                "total_gpu_memory_gb": initial_mem_stats["total_gb"],
+            },
+            step=0,
+        )
+
+    train_data = _load_and_preprocess_data(args, config)
+    LOGGER.debug(f"{len(train_data)} training samples")
+
+    # Log dataset information to Comet
+    if experiment:
+        experiment.log_parameters(
+            {
+                "num_training_samples": len(train_data),
+            }
+        )
+
+    # Standard pytorch dataset iterator
+    dataloader = DataLoader(
+        train_data,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=1,
+        prefetch_factor=2,
+        collate_fn=default_data_collator,
+    )
+    LOGGER.info(f"{len(dataloader)} batches per epoch")
+
+    # Log dataloader information to Comet
+    if experiment:
+        experiment.log_parameters(
+            {
+                "batches_per_epoch": len(dataloader),
+                "total_training_steps": len(dataloader) * args.num_epochs,
+            }
+        )
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, fused=True)
+
+    # NOTE: T_max and eta_min were arbitrarily chosen
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=1000, eta_min=args.lr * 1e-2
+    )
+
+    is_experiment = False
+    exp_dir: Path = Path(args.save_dir)
+    if args.experiment_name is not None:
+        is_experiment = True
+        exp_dir = exp_dir / args.experiment_name
+
+    # attempt resume
+    state = {
+        "epoch": 0,
+        "global_step": 0,
+        "epoch_step": 0,
+        "running_loss": 0,
+    }
+    resumed = False
+    if is_experiment and (exp_dir / "state.json").exists():
+        # NOTE: weights_only is to protect against arbitrary code execution with pickle decoding.
+        def _load_to_device(p):
+            return torch.load(p, map_location=device, weights_only=True)
+
+        model.load_state_dict(_load_to_device(exp_dir / "model.pt"))
+        optimizer.load_state_dict(_load_to_device(exp_dir / "optimizer.pt"))
+        lr_scheduler.load_state_dict(_load_to_device(exp_dir / "lr_scheduler.pt"))
+        with open(exp_dir / "state.json") as fp:
+            state = json.load(fp)
+        resumed = True
+    if is_experiment:
+        LOGGER.info(f"Resumed={resumed} | {state}")
+
+    if is_experiment:
+        LOGGER.info(f"Creating experiment root directory")
+        exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # will be using to understand breakdown of speed
+    timers = {k: LocalTimer(device) for k in ["data", "forward", "backward", "update"]}
+
+    for state["epoch"] in range(state["epoch"], args.num_epochs):
+        LOGGER.info(f"Begin epoch {state['epoch']} at step {state['epoch_step']}")
+
+        progress_bar = tqdm.tqdm(range(len(dataloader)))
+        if state["epoch_step"] > 0:
+            progress_bar.update(state["epoch_step"])
+
+        # NOTE: This is not standard. Normally you can just iterate directly over dataloader.
+        #       We are doing this so we can explicitly measure the time it takes to generate a batch.
+        batches = iter(dataloader)
+
+        for i_step in range(len(dataloader)):
+            # Here we measure the time it takes to generate a batch and move it to the GPU
+            with timers["data"], torch.no_grad():
+                batch = next(batches)
+                batch = {k: v.to(device=device) for k, v in batch.items()}
+
+            # For resuming, this has to come after getting the next batch, so we move through the dataset properly.
+            if i_step < state["epoch_step"]:
+                # NOTE: for resuming
+                continue
+
+            with timers["forward"]:
+                outputs = model(**batch)
+                del batch
+
+            with timers["backward"]:
+                outputs.loss.backward()
+
+            with timers["update"]:
+                optimizer.step()
+                lr_scheduler.step()
+                # NOTE: set_to_none=True will de-allocate the gradients, saving us some memory.
+                optimizer.zero_grad(set_to_none=True)
+
+            state["global_step"] += 1
+            state["epoch_step"] += 1
+            state["running_loss"] += outputs.loss.item()
+            progress_bar.update(1)
+
+            if state["global_step"] % args.log_freq == 0:
+                tok_per_step = args.batch_size * args.seq_length
+                ms_per_step = sum(t.avg_elapsed_ms() for t in timers.values())
+                mem_stats = get_mem_stats(device)
+                avg_loss = state["running_loss"] / args.log_freq
+                current_lr = lr_scheduler.get_last_lr()[0]
+                tokens_per_s = 1000 * tok_per_step / ms_per_step
+
+                info = {
+                    "global_step": state["global_step"],
+                    "lr": current_lr,
+                    "running_loss": avg_loss,
+                    "epoch": state["epoch"],
+                    "epoch_progress": state["epoch_step"] / len(dataloader),
+                    "num_batches_remaining": len(dataloader) - i_step,
+                    **mem_stats,
+                    "tokens_per_s": tokens_per_s,
+                    "time/total": ms_per_step,
+                    **{
+                        f"time/{k}": timer.avg_elapsed_ms()
+                        for k, timer in timers.items()
+                    },
+                }
+
+                # LOGGER.info(info)
+
+                # Log metrics to Comet ML
+                if experiment:
+                    experiment.log_metrics(
+                        {
+                            "loss": avg_loss,
+                            "learning_rate": current_lr,
+                            "tokens_per_second": tokens_per_s,
+                            "epoch": state["epoch"],
+                            "epoch_progress": state["epoch_step"] / len(dataloader),
+                        },
+                        step=state["global_step"],
+                    )
+
+                    # Log GPU memory metrics
+                    experiment.log_metrics(
+                        {
+                            "memory/current_allocated_gb": mem_stats["curr_alloc_gb"],
+                            "memory/peak_allocated_gb": mem_stats["peak_alloc_gb"],
+                            "memory/current_reserved_gb": mem_stats["curr_resv_gb"],
+                            "memory/peak_reserved_gb": mem_stats["peak_resv_gb"],
+                        },
+                        step=state["global_step"],
+                    )
+
+                    # Log timing metrics
+                    experiment.log_metrics(
+                        {
+                            "time/total_ms": ms_per_step,
+                            "time/data_ms": timers["data"].avg_elapsed_ms(),
+                            "time/forward_ms": timers["forward"].avg_elapsed_ms(),
+                            "time/backward_ms": timers["backward"].avg_elapsed_ms(),
+                            "time/update_ms": timers["update"].avg_elapsed_ms(),
+                        },
+                        step=state["global_step"],
+                    )
+
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
+                state["running_loss"] = 0
+                for t in timers.values():
+                    t.reset()
+
+            if is_experiment and state["global_step"] % args.ckpt_freq == 0:
+                LOGGER.info("Saving checkpoint.")
+                torch.save(optimizer.state_dict(), exp_dir / "optimizer.pt")
+                torch.save(model.state_dict(), exp_dir / "model.pt")
+                torch.save(lr_scheduler.state_dict(), exp_dir / "lr_scheduler.pt")
+                with open(exp_dir / "state.json", "w") as fp:
+                    json.dump(state, fp)
+
+                # Log checkpoint to Comet ML
+                if experiment:
+                    experiment.log_model(
+                        name=f"checkpoint-step-{state['global_step']}",
+                        file_or_folder=str(exp_dir),
+                        metadata={
+                            "global_step": state["global_step"],
+                            "epoch": state["epoch"],
+                            "loss": avg_loss if "avg_loss" in locals() else None,
+                        },
+                    )
+
+        # Log epoch completion
+        if experiment:
+            experiment.log_metric(
+                "epoch_completed", state["epoch"], step=state["global_step"]
+            )
+
+        state["epoch_step"] = 0
+
+    # Training completed - end the experiment
+    if experiment:
+        LOGGER.info("Training completed. Ending Comet ML experiment.")
+        experiment.end()
+
+
+def _load_and_preprocess_data(args, config):
+    """
+    Function created using code found in
+    https://github.com/huggingface/transformers/blob/v4.45.1/examples/pytorch/language-modeling/run_clm_no_trainer.py
+    """
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+
+    data = datasets.load_dataset(args.dataset_name, args.dataset_subset)
+
+    column_names = data["train"].column_names
+    text_column_name = "text" if "text" in column_names else column_names[0]
+
+    def tokenize_function(examples):
+        return tokenizer(examples[text_column_name])
+
+    tokenized_datasets = data.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=column_names,
+        num_proc=multiprocessing.cpu_count(),
+        load_from_cache_file=True,
+        desc="Running tokenizer on dataset",
+    )
+
+    seq_length = args.seq_length or tokenizer.model_max_length
+    if seq_length > config.max_position_embeddings:
+        seq_length = min(1024, config.max_position_embeddings)
+
+    # Main data processing function that will concatenate all texts from our dataset and generate chunks of block_size.
+    def group_texts(examples):
+        # Concatenate all texts.
+        concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+        total_length = len(concatenated_examples[list(examples.keys())[0]])
+        # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
+        # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
+        if total_length > seq_length:
+            total_length = (total_length // seq_length) * seq_length
+        # Split by chunks of max_len.
+        result = {
+            k: [t[i : i + seq_length] for i in range(0, total_length, seq_length)]
+            for k, t in concatenated_examples.items()
+        }
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    lm_datasets = tokenized_datasets.map(
+        group_texts,
+        batched=True,
+        num_proc=multiprocessing.cpu_count(),
+        load_from_cache_file=True,
+        desc=f"Grouping texts in chunks of {seq_length}",
+    )
+
+    return lm_datasets["train"]
+
+
+def get_mem_stats(device=None):
+    if device is not None and device.type == "cpu":
+        # Return empty stats for CPU
+        return {
+            "total_gb": 0.0,
+            "curr_alloc_gb": 0.0,
+            "peak_alloc_gb": 0.0,
+            "curr_resv_gb": 0.0,
+            "peak_resv_gb": 0.0,
+        }
+
+    mem = torch.cuda.memory_stats(device)
+    props = torch.cuda.get_device_properties(device)
+    return {
+        "total_gb": 1e-9 * props.total_memory,
+        "curr_alloc_gb": 1e-9 * mem["allocated_bytes.all.current"],
+        "peak_alloc_gb": 1e-9 * mem["allocated_bytes.all.peak"],
+        "curr_resv_gb": 1e-9 * mem["reserved_bytes.all.current"],
+        "peak_resv_gb": 1e-9 * mem["reserved_bytes.all.peak"],
+    }
+
+
+class LocalTimer:
+    def __init__(self, device: torch.device):
+        if device.type == "cpu":
+            self.synchronize = lambda: None  # No synchronization needed for CPU
+        elif device.type == "cuda":
+            self.synchronize = lambda: torch.cuda.synchronize(device=device)
+        self.measurements = []
+        self.start_time = None
+
+    def __enter__(self):
+        self.synchronize()
+        self.start_time = time.time()
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if traceback is None:
+            self.synchronize()
+            end_time = time.time()
+            self.measurements.append(end_time - self.start_time)
+        self.start_time = None
+
+    def avg_elapsed_ms(self):
+        return 1000 * (sum(self.measurements) / len(self.measurements))
+
+    def reset(self):
+        self.measurements = []
+        self.start_time = None
+
+
+def _get_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-e", "--experiment-name", default="single-gpu")
+    parser.add_argument("-d", "--dataset-name", default="tatsu-lab/alpaca")
+    parser.add_argument("-m", "--model-name", default="meta-llama/llama-3.2-1B")
+    parser.add_argument("--dataset-subset", default=None)
+    parser.add_argument("--save-dir", default="../outputs")
+    parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--num-epochs", default=100, type=int)
+    parser.add_argument("--lr", default=3e-5, type=float)
+    parser.add_argument("-b", "--batch-size", default=16, type=int)
+    parser.add_argument("--log-freq", default=1, type=int)
+    parser.add_argument("--ckpt-freq", default=500, type=int)
+    parser.add_argument("-s", "--seq-length", default=1024, type=int)
+
+    # Device and dtype arguments
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=["cpu", "cuda"],
+        help="Device to use for training (cpu or cuda)",
+    )
+    parser.add_argument(
+        "--dtype",
+        default="bf16",
+        choices=["fp32", "fp16", "bf16"],
+        help="Data type for training (fp32, fp16, or bf16)",
+    )
+
+    # Comet ML arguments
+    parser.add_argument(
+        "--comet-project-name",
+        default="distributed-training-demo",
+        help="Comet ML project name",
+    )
+    parser.add_argument(
+        "--comet-workspace", default="intro-ai", help="Comet ML workspace name"
+    )
+
+    return parser
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
