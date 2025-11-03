@@ -248,8 +248,12 @@ Default save root is `--save-dir ../outputs` (relative to each script directory)
 
 ## Acknowledgments
 
-- Inspired by and references: https://github.com/LambdaLabsML/distributed-training-guide
-- Built with PyTorch, Hugging Face Transformers/Datasets, and Comet ML.
+This project is **adapted from** the excellent [Lambda Labs Distributed Training Guide](https://github.com/LambdaLabsML/distributed-training-guide) and modified for educational purposes. Most of the code structure and patterns come from their original work. 🙏
+
+Built with:
+- [PyTorch](https://pytorch.org/)
+- [Hugging Face Transformers](https://huggingface.co/transformers/) and [Datasets](https://huggingface.co/docs/datasets)
+- [Comet ML](https://www.comet.com/)
 
 ---
 
